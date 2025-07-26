@@ -25,6 +25,7 @@ from pose_analyzers.side_plank import SidePlankAnalyzer
 from pose_analyzers.staff_pose import StaffPoseAnalyzer
 from pose_analyzers.t_pose import TPoseAnalyzer
 from pose_analyzers.warrior2_pose import Warrior2PoseAnalyzer
+from pose_analyzers.enhanced_pose_analyzer import EnhancedPoseAnalyzer
 from utils.video_processor import extract_frame_from_video
 
 # Create FastAPI app
@@ -60,6 +61,9 @@ pose_analyzers = {
     "warrior2": Warrior2PoseAnalyzer(),
 }
 
+# Initialize enhanced pose analyzer for hybrid detection
+enhanced_analyzer = EnhancedPoseAnalyzer()
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
@@ -69,7 +73,9 @@ async def root():
         "supported_poses": list(pose_analyzers.keys()),
         "endpoints": {
             "analyze": "/api/analyze/{pose_name}",
+            "analyze_enhanced": "/api/analyze-pose",
             "pose_info": "/api/poses/{pose_name}/info",
+            "enhanced_pose_info": "/api/enhanced-pose-info",
             "health": "/api/health",
             "poses": "/api/poses"
         }
@@ -244,6 +250,95 @@ async def batch_analyze_poses(
         "failed": len([r for r in results if not r.get("success", True)])
     }
 
+from pydantic import BaseModel
+
+class AnalyzePoseRequest(BaseModel):
+    image: str
+    skill_level: Optional[str] = "beginner"
+
+@app.post("/api/analyze-pose")
+async def analyze_pose_enhanced(
+    request: AnalyzePoseRequest
+):
+    """
+    Enhanced pose analysis with hybrid ML and rule-based detection
+    
+    This endpoint uses the enhanced pose analyzer that combines:
+    - Rule-based detection for specific poses (T Pose, Side Plank, Warrior II, etc.)
+    - ML model detection for trained poses
+    - Hybrid decision logic for optimal accuracy
+    
+    Args:
+        request: JSON object containing image (base64) and skill_level
+    """
+    try:
+        import base64
+        import cv2
+        import numpy as np
+        
+        # Parse base64 image data
+        if request.image.startswith('data:image'):
+            # Remove data URL prefix
+            image_data = request.image.split(',')[1]
+        else:
+            image_data = request.image
+            
+        # Decode base64 to bytes
+        image_bytes = base64.b64decode(image_data)
+        
+        # Convert bytes to numpy array
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not decode image. Please ensure the image is valid."
+            )
+        
+        # Analyze pose using enhanced analyzer
+        result = enhanced_analyzer.analyze_pose(frame)
+        
+        # Add additional metadata
+        result["skill_level"] = request.skill_level
+        result["analysis_type"] = "enhanced_hybrid"
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error analyzing pose: {str(e)}"
+        )
+
+@app.get("/api/enhanced-pose-info")
+async def get_enhanced_pose_info():
+    """Get information about the enhanced pose analyzer"""
+    supported_poses = enhanced_analyzer.get_supported_poses()
+    session_summary = enhanced_analyzer.get_session_summary()
+    
+    return {
+        "analyzer_type": "Enhanced Hybrid Pose Analyzer",
+        "description": "Combines rule-based and ML detection for maximum accuracy",
+        "supported_poses": supported_poses,
+        "session_summary": session_summary,
+        "detection_methods": {
+            "rule_based": "Mathematical angle and distance analysis",
+            "ml_based": "Trained RandomForest model with comprehensive features",
+            "hybrid": "Intelligent combination of both methods"
+        },
+        "features": [
+            "Real-time pose landmark extraction",
+            "Comprehensive angle calculations", 
+            "Body alignment analysis",
+            "Confidence-based pose selection",
+            "Session tracking and statistics",
+            "Multi-method pose validation"
+        ]
+    }
+
 @app.get("/api/analytics/summary")
 async def get_analytics_summary():
     """Get summary analytics for the API"""
@@ -272,6 +367,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"🎯 Supported Poses: {len(pose_analyzers)}")
     print(f"📊 Pose Types: {list(pose_analyzers.keys())}")
+    print("🤖 Enhanced Analyzer: Hybrid ML + Rule-based Detection")
     print("🚀 Features: AI Analysis, Real-time Feedback, Multi-pose Support")
     print("🌐 API Docs: http://localhost:8000/docs")
     print("=" * 60)

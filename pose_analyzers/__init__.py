@@ -15,6 +15,7 @@ from .side_plank import SidePlankAnalyzer
 from .staff_pose import StaffPoseAnalyzer
 from .t_pose import TPoseAnalyzer
 from .warrior2_pose import Warrior2PoseAnalyzer
+from .enhanced_pose_analyzer import EnhancedPoseAnalyzer
 
 __all__ = [
     'BasePoseAnalyzer',
@@ -28,5 +29,6 @@ __all__ = [
     'SidePlankAnalyzer',
     'StaffPoseAnalyzer',
     'TPoseAnalyzer',
-    'Warrior2PoseAnalyzer'
+    'Warrior2PoseAnalyzer',
+    'EnhancedPoseAnalyzer'
 ] 
