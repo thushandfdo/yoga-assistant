@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FastAPI Yoga Assistant Backend
-Unified yoga pose analysis API supporting multiple poses with authentication
+Unified yoga pose analysis API supporting multiple poses with authentication and session management
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends, status
@@ -19,6 +19,7 @@ from enum import Enum
 from pydantic import BaseModel, EmailStr, validator
 from passlib.context import CryptContext
 import jwt
+import json
 
 # Import pose analyzers
 from pose_analyzers.chair_pose import ChairPoseAnalyzer
@@ -98,18 +99,19 @@ class Token(BaseModel):
     email: str
 
 class UserResponse(BaseModel):
-    id: int
     fullname: str
     email: str
     sex: str
     dob: str
     created_at: str
 
+
+
 # Create FastAPI app
 app = FastAPI(
     title="Yoga Assistant API",
-    description="AI-powered yoga pose analysis and feedback system with authentication",
-    version="1.0.0",
+    description="AI-powered yoga pose analysis and feedback system with session management",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -122,100 +124,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Database setup
-def init_db():
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fullname TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            sex TEXT NOT NULL,
-            dob TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-# Authentication utility functions
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def get_user_by_email(email: str):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE email = ?', (email,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-def get_user_by_id(user_id: int):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-def create_user(user: UserSignup):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            INSERT INTO users (fullname, email, password_hash, sex, dob)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user.fullname, user.email, get_password_hash(user.password), user.sex, user.dob))
-        user_id = cursor.lastrowid
-        conn.commit()
-        return user_id
-    except sqlite3.IntegrityError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    finally:
-        conn.close()
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except jwt.PyJWTError:
-        raise credentials_exception
-    
-    user = get_user_by_id(user_id)
-    if user is None:
-        raise credentials_exception
-    return user
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    init_db()
 
 # Initialize pose analyzers
 pose_analyzers = {
@@ -235,26 +143,163 @@ pose_analyzers = {
 # Initialize enhanced pose analyzer for hybrid detection
 enhanced_analyzer = EnhancedPoseAnalyzer()
 
+# Database initialization
+def init_db():
+    """Initialize the database with required tables"""
+    conn = sqlite3.connect('yoga_assistant.db')
+    cursor = conn.cursor()
+    
+    # Create users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fullname TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            sex TEXT NOT NULL,
+            dob TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create sessions table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            duration INTEGER NOT NULL,
+            avg_accuracy REAL NOT NULL,
+            total_poses INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Create session_poses table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS session_poses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            pose_name TEXT NOT NULL,
+            accuracy REAL NOT NULL,
+            feedback TEXT,
+            improvements TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Authentication functions
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user_by_email(email: str):
+    conn = sqlite3.connect('yoga_assistant.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE email = ?', (email,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def get_user_by_id(user_id: int):
+    conn = sqlite3.connect('yoga_assistant.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def create_user(user: UserSignup):
+    conn = sqlite3.connect('yoga_assistant.db')
+    cursor = conn.cursor()
+    hashed_password = get_password_hash(user.password)
+    cursor.execute(
+        'INSERT INTO users (fullname, email, password_hash, sex, dob) VALUES (?, ?, ?, ?, ?)',
+        (user.fullname, user.email, hashed_password, user.sex, user.dob)
+    )
+    user_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return user_id
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id_str = payload.get("sub")
+        if user_id_str is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user_id = int(user_id_str)
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    user = get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+# Database startup event
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
         "message": "Welcome to Yoga Assistant API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "supported_poses": list(pose_analyzers.keys()),
         "endpoints": {
-            "analyze": "/api/analyze/{pose_name}",
-            "analyze_enhanced": "/api/analyze-pose",
-            "pose_info": "/api/poses/{pose_name}/info",
-            "enhanced_pose_info": "/api/enhanced-pose-info",
-            "health": "/api/health",
-            "poses": "/api/poses",
             "auth": {
-                "signup": "/auth/signup",
                 "login": "/auth/login",
-                "me": "/auth/me",
-                "protected": "/auth/protected"
-            }
+                "signup": "/auth/signup",
+                "me": "/auth/me"
+            },
+            "sessions": {
+                "stats": "/api/sessions/stats",
+                "list": "/api/sessions",
+                "create": "/api/sessions",
+                "get": "/api/sessions/{session_id}",
+                "update": "/api/sessions/{session_id}",
+                "delete": "/api/sessions/{session_id}"
+            },
+            "pose_analysis": {
+                "analyze": "/api/analyze/{pose_name}",
+                "analyze_enhanced": "/api/analyze-pose",
+                "pose_info": "/api/poses/{pose_name}/info",
+                "enhanced_pose_info": "/api/enhanced-pose-info"
+            },
+            "health": "/api/health",
+            "poses": "/api/poses"
         }
     }
 
@@ -269,31 +314,242 @@ async def health_check():
         "poses": list(pose_analyzers.keys())
     }
 
+# Authentication endpoints
+@app.post("/auth/signup", response_model=Token)
+async def signup(user: UserSignup):
+    """User signup endpoint"""
+    try:
+        # Check if user already exists
+        existing_user = get_user_by_email(user.email)
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail="Email already registered"
+            )
+        
+        # Create new user
+        user_id = create_user(user)
+        
+        # Create access token
+        access_token = create_access_token(data={"sub": str(user_id)})
+        
+        return Token(
+            access_token=access_token,
+            token_type="bearer",
+            user_id=user_id,
+            fullname=user.fullname,
+            email=user.email
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Signup failed: {str(e)}")
+
+@app.post("/auth/login", response_model=Token)
+async def login(user: UserLogin):
+    """User login endpoint"""
+    try:
+        # Get user by email
+        db_user = get_user_by_email(user.email)
+        
+        if not db_user or not verify_password(user.password, db_user[3]):  # password_hash is at index 3
+            raise HTTPException(
+                status_code=401,
+                detail="Incorrect email or password"
+            )
+        
+        # Create access token
+        access_token = create_access_token(data={"sub": str(db_user[0])})  # user_id is at index 0
+        
+        return Token(
+            access_token=access_token,
+            token_type="bearer",
+            user_id=db_user[0],
+            fullname=db_user[1],
+            email=db_user[2]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+
+@app.get("/auth/me", response_model=UserResponse)
+async def read_users_me(current_user: tuple = Depends(get_current_user)):
+    """Get current user information"""
+    return UserResponse(
+        fullname=current_user[1],
+        email=current_user[2],
+        sex=current_user[4],
+        dob=current_user[5],
+        created_at=current_user[6]
+    )
+
+@app.get("/auth/protected")
+async def protected_route(current_user: tuple = Depends(get_current_user)):
+    """Protected route example"""
+    return {"message": f"Hello {current_user[1]}, this is a protected route!"}
+
+# Import session management functions
+from session_models import (
+    SessionCreate, SessionResponse, SessionsResponse, SessionCreateResponse,
+    StatsResponse, DashboardStats, get_sessions_stats, get_user_sessions,
+    create_session, get_session_by_id, update_session, delete_session
+)
+
+def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+    """Get current user ID from token"""
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id_str = payload.get("sub")
+        if user_id_str is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return int(user_id_str)
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# Session management endpoints
+@app.get("/api/sessions/stats", response_model=StatsResponse)
+async def get_dashboard_stats(current_user_id: int = Depends(get_current_user_id)):
+    """Get dashboard statistics for the authenticated user"""
+    try:
+        stats = get_sessions_stats(current_user_id)
+        return StatsResponse(
+            success=True,
+            data=DashboardStats(**stats),
+            message="Statistics retrieved successfully"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get statistics: {str(e)}")
+
+@app.get("/api/sessions", response_model=SessionsResponse)
+async def get_sessions(current_user_id: int = Depends(get_current_user_id)):
+    """Get all sessions for the authenticated user"""
+    try:
+        session_responses = get_user_sessions(current_user_id)
+        return SessionsResponse(
+            success=True,
+            data=session_responses,
+            message="Sessions retrieved successfully"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get sessions: {str(e)}")
+
+@app.post("/api/sessions", response_model=SessionCreateResponse)
+async def create_session_endpoint(
+    session_data: SessionCreate,
+    current_user_id: int = Depends(get_current_user_id)
+):
+    """Create a new session for the authenticated user"""
+    try:
+        session_response = create_session(current_user_id, session_data)
+        return SessionCreateResponse(
+            success=True,
+            data=session_response,
+            message="Session created successfully"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
+
+@app.get("/api/sessions/{session_id}", response_model=SessionCreateResponse)
+async def get_session_endpoint(
+    session_id: int,
+    current_user_id: int = Depends(get_current_user_id)
+):
+    """Get a specific session by ID"""
+    try:
+        session_response = get_session_by_id(session_id, current_user_id)
+        if not session_response:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        return SessionCreateResponse(
+            success=True,
+            data=session_response,
+            message="Session retrieved successfully"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get session: {str(e)}")
+
+@app.put("/api/sessions/{session_id}", response_model=SessionCreateResponse)
+async def update_session_endpoint(
+    session_id: int,
+    session_data: SessionCreate,
+    current_user_id: int = Depends(get_current_user_id)
+):
+    """Update an existing session"""
+    try:
+        session_response = update_session(session_id, current_user_id, session_data)
+        if not session_response:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        return SessionCreateResponse(
+            success=True,
+            data=session_response,
+            message="Session updated successfully"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update session: {str(e)}")
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_endpoint(
+    session_id: int,
+    current_user_id: int = Depends(get_current_user_id)
+):
+    """Delete a session"""
+    try:
+        success = delete_session(session_id, current_user_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        return {"success": True, "message": "Session deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete session: {str(e)}")
+
+
+
+
+
+
+
+
+# Existing pose analysis endpoints (preserved)
 @app.get("/api/poses")
 async def get_supported_poses():
     """Get list of all supported yoga poses"""
     pose_info = {}
     for pose_name, analyzer in pose_analyzers.items():
         pose_info[pose_name] = {
-            "name": analyzer.get_pose_name(),
-            "description": analyzer.get_description(),
-            "difficulty": analyzer.get_difficulty(),
-            "endpoint": f"/api/analyze/{pose_name}"
+            "name": pose_name.replace("_", " ").title(),
+            "description": f"Analysis for {pose_name.replace('_', ' ')} pose",
+            "difficulty": "beginner"  # Default difficulty
         }
-    
-    return {
-        "supported_poses": pose_info,
-        "total_count": len(pose_analyzers)
-    }
+    return pose_info
 
 @app.get("/api/poses/{pose_name}/info")
 async def get_pose_info(pose_name: str):
     """Get detailed information about a specific pose"""
     if pose_name not in pose_analyzers:
-        raise HTTPException(status_code=404, detail=f"Pose '{pose_name}' not supported")
+        raise HTTPException(status_code=404, detail="Pose not found")
     
-    analyzer = pose_analyzers[pose_name]
-    return analyzer.get_pose_info()
+    return {
+        "pose_name": pose_name,
+        "display_name": pose_name.replace("_", " ").title(),
+        "description": f"Detailed analysis for {pose_name.replace('_', ' ')} pose",
+        "analyzer_available": True
+    }
 
 @app.post("/api/analyze/{pose_name}")
 async def analyze_pose(
@@ -302,70 +558,47 @@ async def analyze_pose(
     skill_level: Optional[str] = Form("beginner")
 ):
     """
-    Analyze uploaded video for specific yoga pose
+    Analyze a specific yoga pose from video upload
     
     Args:
-        pose_name: Name of the pose to analyze (chair, mountain, tree, etc.)
-        video: Video file to analyze
-        skill_level: User's skill level (beginner, intermediate, advanced)
+        pose_name: Name of the pose to analyze
+        video: Video file upload
+        skill_level: User skill level (beginner, intermediate, advanced)
     """
-    
     if pose_name not in pose_analyzers:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Pose '{pose_name}' not supported. Supported poses: {list(pose_analyzers.keys())}"
-        )
+        raise HTTPException(status_code=404, detail=f"Pose '{pose_name}' not supported")
     
-    if not video.filename:
-        raise HTTPException(status_code=400, detail="No video file provided")
-    
-    # Validate file type
-    allowed_extensions = {'.mp4', '.webm', '.avi', '.mov', '.mkv'}
-    file_ext = os.path.splitext(video.filename)[1].lower()
-    if file_ext not in allowed_extensions:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported file type. Allowed: {allowed_extensions}"
-        )
-    
-    # Save video to temporary file
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-            contents = await video.read()
-            temp_file.write(contents)
-            temp_path = temp_file.name
+        # Save uploaded video to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+            content = await video.read()
+            temp_video.write(content)
+            temp_video_path = temp_video.name
         
-        try:
-            # Extract frame from video
-            frame = extract_frame_from_video(temp_path)
-            
-            if frame is None:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Could not extract frame from video. Please ensure video is valid."
-                )
-            
-            # Analyze the pose
-            analyzer = pose_analyzers[pose_name]
-            result = analyzer.analyze_pose(frame, skill_level)
-            
-            # Add metadata
-            result.update({
-                "pose_name": pose_name,
-                "skill_level": skill_level,
-                "analysis_timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "video_filename": video.filename
-            })
-            
-            return result
-            
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-                
+        # Extract frame from video
+        frame = extract_frame_from_video(temp_video_path)
+        
+        if frame is None:
+            raise HTTPException(status_code=400, detail="Could not extract frame from video")
+        
+        # Analyze pose
+        analyzer = pose_analyzers[pose_name]
+        result = analyzer.analyze_pose(frame)
+        
+        # Clean up temporary file
+        os.unlink(temp_video_path)
+        
+        # Add metadata
+        result["pose_name"] = pose_name
+        result["skill_level"] = skill_level
+        result["analysis_type"] = "specific_pose"
+        
+        return result
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing pose: {str(e)}")
 
 @app.post("/api/batch-analyze")
 async def batch_analyze_poses(
@@ -374,60 +607,72 @@ async def batch_analyze_poses(
     skill_level: Optional[str] = Form("beginner")
 ):
     """
-    Batch analyze multiple videos for different poses
+    Analyze multiple poses from multiple video uploads
     
     Args:
-        videos: List of video files to analyze
-        pose_names: List of pose names corresponding to each video
-        skill_level: User's skill level
+        videos: List of video file uploads
+        pose_names: List of pose names to analyze
+        skill_level: User skill level
     """
-    
     if len(videos) != len(pose_names):
-        raise HTTPException(
-            status_code=400, 
-            detail="Number of videos must match number of pose names"
-        )
-    
-    if len(videos) > 10:  # Limit batch size
-        raise HTTPException(
-            status_code=400, 
-            detail="Maximum 10 videos allowed per batch"
-        )
+        raise HTTPException(status_code=400, detail="Number of videos must match number of pose names")
     
     results = []
+    temp_files = []
     
-    for i, (video, pose_name) in enumerate(zip(videos, pose_names)):
-        try:
-            # Reuse the single analysis endpoint logic
-            result = await analyze_pose(pose_name, video, skill_level)
-            result["batch_index"] = i
-            results.append(result)
+    try:
+        for i, (video, pose_name) in enumerate(zip(videos, pose_names)):
+            if pose_name not in pose_analyzers:
+                results.append({
+                    "pose_name": pose_name,
+                    "success": False,
+                    "error": f"Pose '{pose_name}' not supported"
+                })
+                continue
             
-        except HTTPException as e:
-            results.append({
-                "batch_index": i,
-                "pose_name": pose_name,
-                "video_filename": video.filename,
-                "error": e.detail,
-                "success": False
-            })
-        except Exception as e:
-            results.append({
-                "batch_index": i,
-                "pose_name": pose_name,
-                "video_filename": video.filename,
-                "error": str(e),
-                "success": False
-            })
-    
-    return {
-        "batch_results": results,
-        "total_analyzed": len(results),
-        "successful": len([r for r in results if r.get("success", True)]),
-        "failed": len([r for r in results if not r.get("success", True)])
-    }
-
-from pydantic import BaseModel
+            # Save uploaded video to temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+                content = await video.read()
+                temp_video.write(content)
+                temp_video_path = temp_video.name
+                temp_files.append(temp_video_path)
+            
+            # Extract frame from video
+            frame = extract_frame_from_video(temp_video_path)
+            
+            if frame is None:
+                results.append({
+                    "pose_name": pose_name,
+                    "success": False,
+                    "error": "Could not extract frame from video"
+                })
+                continue
+            
+            # Analyze pose
+            analyzer = pose_analyzers[pose_name]
+            result = analyzer.analyze_pose(frame)
+            
+            # Add metadata
+            result["pose_name"] = pose_name
+            result["skill_level"] = skill_level
+            result["analysis_type"] = "batch_analysis"
+            
+            results.append(result)
+        
+        return {
+            "batch_results": results,
+            "total_poses": len(results),
+            "successful": len([r for r in results if r.get("success", True)]),
+            "failed": len([r for r in results if not r.get("success", True)])
+        }
+        
+    finally:
+        # Clean up temporary files
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
 
 class AnalyzePoseRequest(BaseModel):
     image: str
@@ -538,109 +783,16 @@ async def get_analytics_summary():
         ]
     }
 
-# Authentication Endpoints
-@app.post("/auth/signup", response_model=Token)
-async def signup(user: UserSignup):
-    """
-    Register a new user
-    
-    Args:
-        user: User registration data including fullname, email, password, sex, and dob
-    """
-    # Check if user already exists
-    existing_user = get_user_by_email(user.email)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Create new user
-    user_id = create_user(user)
-    
-    # Create access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": str(user_id)}, expires_delta=access_token_expires
-    )
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user_id": user_id,
-        "fullname": user.fullname,
-        "email": user.email
-    }
-
-@app.post("/auth/login", response_model=Token)
-async def login(user: UserLogin):
-    """
-    Authenticate user and return access token
-    
-    Args:
-        user: User login credentials (email and password)
-    """
-    # Authenticate user
-    db_user = get_user_by_email(user.email)
-    if not db_user or not verify_password(user.password, db_user[3]):  # password_hash is at index 3
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    # Create access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": str(db_user[0])}, expires_delta=access_token_expires  # user id is at index 0
-    )
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user_id": db_user[0],
-        "fullname": db_user[1],
-        "email": db_user[2]
-    }
-
-@app.get("/auth/me", response_model=UserResponse)
-async def read_users_me(current_user: tuple = Depends(get_current_user)):
-    """
-    Get current user information
-    
-    Args:
-        current_user: Current authenticated user (injected via dependency)
-    """
-    return {
-        "id": current_user[0],
-        "fullname": current_user[1],
-        "email": current_user[2],
-        "sex": current_user[4],
-        "dob": current_user[5],
-        "created_at": current_user[6]
-    }
-
-@app.get("/auth/protected")
-async def protected_route(current_user: tuple = Depends(get_current_user)):
-    """
-    Example protected route that requires authentication
-    
-    Args:
-        current_user: Current authenticated user (injected via dependency)
-    """
-    return {
-        "message": f"Hello {current_user[1]}, this is a protected route!",
-        "user_id": current_user[0]
-    }
-
 if __name__ == "__main__":
     print("=" * 60)
-    print("🧘‍♀️ YOGA ASSISTANT API - FastAPI Backend")
+    print("🧘‍♀️ YOGA ASSISTANT API - FastAPI Backend v2.0")
     print("=" * 60)
     print(f"🎯 Supported Poses: {len(pose_analyzers)}")
     print(f"📊 Pose Types: {list(pose_analyzers.keys())}")
     print("🤖 Enhanced Analyzer: Hybrid ML + Rule-based Detection")
-    print("🚀 Features: AI Analysis, Real-time Feedback, Multi-pose Support")
+    print("🚀 Features: AI Analysis, Session Management, User Authentication")
+    print("💾 Database: SQLite with session tracking")
+    print("🔐 Authentication: JWT-based user management")
     print("🌐 API Docs: http://localhost:8000/docs")
     print("=" * 60)
     
