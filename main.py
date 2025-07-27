@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
 FastAPI Yoga Assistant Backend
-Unified yoga pose analysis API supporting multiple poses
+Unified yoga pose analysis API supporting multiple poses with authentication
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
 import tempfile
 import os
 from typing import List, Optional
 import time
+import sqlite3
+from datetime import datetime, timedelta
+from enum import Enum
+from pydantic import BaseModel, EmailStr, validator
+from passlib.context import CryptContext
+import jwt
 
 # Import pose analyzers
 from pose_analyzers.chair_pose import ChairPoseAnalyzer
@@ -28,10 +35,80 @@ from pose_analyzers.warrior2_pose import Warrior2PoseAnalyzer
 from pose_analyzers.enhanced_pose_analyzer import EnhancedPoseAnalyzer
 from utils.video_processor import extract_frame_from_video
 
+# Authentication Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+# Enums
+class Sex(str, Enum):
+    male = "male"
+    female = "female"
+    other = "other"
+
+# Authentication Pydantic models
+class UserSignup(BaseModel):
+    fullname: str
+    email: EmailStr
+    password: str
+    sex: Sex
+    dob: str  # Format: YYYY-MM-DD
+    
+    @validator('fullname')
+    def validate_fullname(cls, v):
+        if len(v.strip()) < 2:
+            raise ValueError('Full name must be at least 2 characters long')
+        return v.strip()
+    
+    @validator('password')
+    def validate_password(cls, v):
+        if len(v) < 6:
+            raise ValueError('Password must be at least 6 characters long')
+        return v
+    
+    @validator('dob')
+    def validate_dob(cls, v):
+        try:
+            dob_date = datetime.strptime(v, '%Y-%m-%d').date()
+            today = datetime.now().date()
+            age = today.year - dob_date.year - ((today.month, today.day) < (dob_date.month, dob_date.day))
+            if age < 13:
+                raise ValueError('User must be at least 13 years old')
+            if age > 120:
+                raise ValueError('Invalid date of birth')
+        except ValueError as e:
+            if 'time data' in str(e):
+                raise ValueError('Date must be in YYYY-MM-DD format')
+            raise e
+        return v
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: int
+    fullname: str
+    email: str
+
+class UserResponse(BaseModel):
+    id: int
+    fullname: str
+    email: str
+    sex: str
+    dob: str
+    created_at: str
+
 # Create FastAPI app
 app = FastAPI(
     title="Yoga Assistant API",
-    description="AI-powered yoga pose analysis and feedback system",
+    description="AI-powered yoga pose analysis and feedback system with authentication",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -45,6 +122,100 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Database setup
+def init_db():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fullname TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            sex TEXT NOT NULL,
+            dob TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Authentication utility functions
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user_by_email(email: str):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE email = ?', (email,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def get_user_by_id(user_id: int):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def create_user(user: UserSignup):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO users (fullname, email, password_hash, sex, dob)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user.fullname, user.email, get_password_hash(user.password), user.sex, user.dob))
+        user_id = cursor.lastrowid
+        conn.commit()
+        return user_id
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    finally:
+        conn.close()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: int = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+    
+    user = get_user_by_id(user_id)
+    if user is None:
+        raise credentials_exception
+    return user
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 # Initialize pose analyzers
 pose_analyzers = {
@@ -77,7 +248,13 @@ async def root():
             "pose_info": "/api/poses/{pose_name}/info",
             "enhanced_pose_info": "/api/enhanced-pose-info",
             "health": "/api/health",
-            "poses": "/api/poses"
+            "poses": "/api/poses",
+            "auth": {
+                "signup": "/auth/signup",
+                "login": "/auth/login",
+                "me": "/auth/me",
+                "protected": "/auth/protected"
+            }
         }
     }
 
@@ -359,6 +536,101 @@ async def get_analytics_summary():
             "Personalized feedback",
             "Skill-level adaptation"
         ]
+    }
+
+# Authentication Endpoints
+@app.post("/auth/signup", response_model=Token)
+async def signup(user: UserSignup):
+    """
+    Register a new user
+    
+    Args:
+        user: User registration data including fullname, email, password, sex, and dob
+    """
+    # Check if user already exists
+    existing_user = get_user_by_email(user.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    user_id = create_user(user)
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user_id)}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user_id,
+        "fullname": user.fullname,
+        "email": user.email
+    }
+
+@app.post("/auth/login", response_model=Token)
+async def login(user: UserLogin):
+    """
+    Authenticate user and return access token
+    
+    Args:
+        user: User login credentials (email and password)
+    """
+    # Authenticate user
+    db_user = get_user_by_email(user.email)
+    if not db_user or not verify_password(user.password, db_user[3]):  # password_hash is at index 3
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(db_user[0])}, expires_delta=access_token_expires  # user id is at index 0
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": db_user[0],
+        "fullname": db_user[1],
+        "email": db_user[2]
+    }
+
+@app.get("/auth/me", response_model=UserResponse)
+async def read_users_me(current_user: tuple = Depends(get_current_user)):
+    """
+    Get current user information
+    
+    Args:
+        current_user: Current authenticated user (injected via dependency)
+    """
+    return {
+        "id": current_user[0],
+        "fullname": current_user[1],
+        "email": current_user[2],
+        "sex": current_user[4],
+        "dob": current_user[5],
+        "created_at": current_user[6]
+    }
+
+@app.get("/auth/protected")
+async def protected_route(current_user: tuple = Depends(get_current_user)):
+    """
+    Example protected route that requires authentication
+    
+    Args:
+        current_user: Current authenticated user (injected via dependency)
+    """
+    return {
+        "message": f"Hello {current_user[1]}, this is a protected route!",
+        "user_id": current_user[0]
     }
 
 if __name__ == "__main__":
